@@ -1,4 +1,5 @@
 import os, time, threading, logging
+import subprocess
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import MAIN_DISPATCHER, CONFIG_DISPATCHER, set_ev_cls
@@ -14,10 +15,12 @@ try:
     HOP_INTERVAL = int(os.environ.get("HOP_INTERVAL", "5"))  # Base interval in seconds
     THREAT_LEVEL = os.environ.get("THREAT_LEVEL", "LOW")  # LOW, MEDIUM, HIGH
     ENERGY_MODE = os.environ.get("ENERGY_MODE", "NORMAL")  # LOW, NORMAL
+    POWER_MANAGEMENT = os.environ.get("POWER_MANAGEMENT", "OFF")  # ON, OFF
 except:
     HOP_INTERVAL = 5
     THREAT_LEVEL = "LOW"
     ENERGY_MODE = "NORMAL"
+    POWER_MANAGEMENT = "OFF"
 
 # Define the set of possible ports for Layer 2 Port Hopping
 BASE_SERVER_PORT = 8080
@@ -39,6 +42,10 @@ class MTDMultiLayer(app_manager.RyuApp):
         self.total_flow_messages = 0
         self.lock = threading.Lock()
 
+        # Power management state tracking
+        self.host_power_state = {}  # ip -> "ACTIVE" or "LOW_POWER"
+        self.power_management_enabled = POWER_MANAGEMENT == "ON"
+
         # MTD decision engine replaces the simple hop_loop
         self.decision_thread = threading.Thread(target=self._decision_loop)
         self.decision_thread.daemon = True
@@ -51,12 +58,13 @@ class MTDMultiLayer(app_manager.RyuApp):
 
         self.logger.setLevel(logging.INFO)
         self.logger.info(
-            "MTD Multi-Layer started. VIP=%s:%s VMAC=%s, THREAT=%s, ENERGY=%s",
+            "MTD Multi-Layer started. VIP=%s:%s VMAC=%s, THREAT=%s, ENERGY=%s, POWER_MGMT=%s",
             VIRTUAL_IP,
             self.current_vip_port,
             VIRTUAL_MAC,
             THREAT_LEVEL,
             ENERGY_MODE,
+            "ON" if self.power_management_enabled else "OFF",
         )
 
     def _track_flow_message(self, count, action_name):
@@ -152,9 +160,21 @@ class MTDMultiLayer(app_manager.RyuApp):
 
         # 4. Set the initial holder
         with self.lock:
+            # Initialize power states for all discovered hosts
+            if self.power_management_enabled:
+                for host_ip in self.host_ip_map.keys():
+                    if host_ip != VIRTUAL_IP and host_ip.startswith("10.0.0."):
+                        self.host_power_state[host_ip] = "LOW_POWER"
+                        self.logger.debug(
+                            f"[POWER] Initialized {host_ip} state to LOW_POWER"
+                        )
+
             self._hop_ip()
             if self.virtual_holder:
                 self.logger.info(f"MTD holder initialized to: {self.virtual_holder}")
+                # Wake up the initial holder
+                if self.power_management_enabled:
+                    self._wake_host(self.virtual_holder)
             else:
                 self.logger.error(
                     "Failed to initialize MTD holder. host_ip_map is empty or contains too few entries."
@@ -240,6 +260,289 @@ class MTDMultiLayer(app_manager.RyuApp):
             self.logger.info(
                 f"[L2 DELETE] Deleted forward flows for old port {old_vip_port} on dpid={dp.id}"
             )
+
+    # --- Power Management Methods ---
+    def _put_host_in_low_power(self, host_ip):
+        """Puts a host into low-power mode by suspending its server process."""
+        if not self.power_management_enabled:
+            return
+
+        if host_ip not in self.host_ip_map:
+            self.logger.warning(
+                f"[POWER] Cannot put {host_ip} in low-power: host not in map"
+            )
+            return
+
+        try:
+            # Get hostname from IP (assuming format 10.0.0.X -> hX)
+            host_num = host_ip.split(".")[-1]
+            hostname = f"h{host_num}"
+
+            self.logger.info(
+                f"[POWER] Attempting to put host {host_ip} ({hostname}) in LOW_POWER mode"
+            )
+
+            # Method 1: Try Mininet network namespace (works for Mininet hosts)
+            # Mininet creates network namespaces named after hostnames (e.g., "h1", "h2")
+            cmd_mininet = [
+                "ip",
+                "netns",
+                "exec",
+                hostname,
+                "pkill",
+                "-STOP",
+                "-f",
+                f"python.*{BASE_SERVER_PORT}",
+            ]
+
+            # Method 2: Fallback to SSH (for real network hosts)
+            cmd_ssh = [
+                "ssh",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "ConnectTimeout=1",
+                f"root@{host_ip}",
+                f"pkill -STOP -f 'python.*{BASE_SERVER_PORT}' || pkill -STOP -f 'python3.*{BASE_SERVER_PORT}' || true",
+            ]
+
+            # Try Mininet namespace first (faster, no network overhead)
+            # First check if we're in a Mininet environment
+            in_mininet_env = False
+            namespace_exists = False
+            try:
+                check_ns = subprocess.run(
+                    ["ip", "netns", "list"],
+                    capture_output=True,
+                    timeout=0.5,
+                    text=True,
+                    check=False,
+                )
+                if check_ns.returncode == 0 and check_ns.stdout.strip():
+                    # We're in a namespace environment (likely Mininet)
+                    in_mininet_env = True
+                    namespaces = check_ns.stdout.strip().split("\n")
+                    namespace_exists = any(hostname in ns for ns in namespaces if ns)
+                    self.logger.debug(
+                        f"[POWER] Namespace check: found={namespaces}, hostname={hostname}, exists={namespace_exists}"
+                    )
+
+                    if namespace_exists:
+                        # Try to suspend process in namespace
+                        result = subprocess.run(
+                            cmd_mininet,
+                            capture_output=True,
+                            timeout=1,
+                            text=True,
+                            check=False,
+                        )
+                        if result.returncode == 0:
+                            self.host_power_state[host_ip] = "LOW_POWER"
+                            self.logger.info(
+                                f"[POWER] Host {host_ip} -> LOW_POWER (server suspended via namespace)"
+                            )
+                            return
+                        else:
+                            # pkill might not find process (returncode 1) - that's okay
+                            self.logger.debug(
+                                f"[POWER] Namespace command returned {result.returncode} for {host_ip} (process may not exist)"
+                            )
+                    else:
+                        # Namespaces exist but this host's namespace not found
+                        self.logger.debug(
+                            f"[POWER] Namespace '{hostname}' not found in available namespaces"
+                        )
+                else:
+                    # No namespaces found - not in Mininet environment
+                    self.logger.debug(
+                        f"[POWER] No network namespaces found - not in Mininet environment"
+                    )
+            except Exception as e:
+                # Can't check namespaces - log but don't assume Mininet
+                self.logger.debug(f"[POWER] Cannot check namespaces for {host_ip}: {e}")
+
+            # CRITICAL: Only try SSH if we're NOT in a Mininet environment
+            # If in_mininet_env is True, NEVER try SSH (avoids timeouts)
+            # Also, if we're using Mininet IPs (10.0.0.x), assume Mininet and skip SSH
+            is_mininet_ip = host_ip.startswith("10.0.0.") and host_ip != VIRTUAL_IP
+
+            if not in_mininet_env and not is_mininet_ip:
+                # Only try SSH for non-Mininet IPs and when not in namespace environment
+                try:
+                    result = subprocess.run(
+                        cmd_ssh, capture_output=True, timeout=1, text=True, check=False
+                    )
+                    if result.returncode == 0:
+                        self.host_power_state[host_ip] = "LOW_POWER"
+                        self.logger.info(
+                            f"[POWER] Host {host_ip} -> LOW_POWER (server suspended via SSH)"
+                        )
+                        return
+                except Exception:
+                    # SSH not available - skip silently to avoid log spam
+                    pass
+            else:
+                # We're in Mininet - skip SSH to avoid timeouts
+                if in_mininet_env:
+                    self.logger.debug(
+                        f"[POWER] Skipping SSH for {host_ip} (Mininet namespace environment detected)"
+                    )
+                elif is_mininet_ip:
+                    self.logger.debug(
+                        f"[POWER] Skipping SSH for {host_ip} (Mininet IP range detected)"
+                    )
+
+            # If both methods failed, still update state for tracking
+            self.host_power_state[host_ip] = "LOW_POWER"
+            self.logger.info(
+                f"[POWER] Host {host_ip} -> LOW_POWER (state tracked - process control not available)"
+            )
+
+        except Exception as e:
+            self.logger.warning(
+                f"[POWER] Failed to put {host_ip} in low-power mode: {e}"
+            )
+            # Still update state for tracking
+            self.host_power_state[host_ip] = "LOW_POWER"
+
+    def _wake_host(self, host_ip):
+        """Wakes up a host by resuming its server process."""
+        if not self.power_management_enabled:
+            return
+
+        if host_ip not in self.host_ip_map:
+            self.logger.warning(f"[POWER] Cannot wake {host_ip}: host not in map")
+            return
+
+        try:
+            # Get hostname from IP
+            host_num = host_ip.split(".")[-1]
+            hostname = f"h{host_num}"
+
+            self.logger.info(f"[POWER] Attempting to wake host {host_ip} ({hostname})")
+
+            # Method 1: Try Mininet network namespace (works for Mininet hosts)
+            cmd_mininet = [
+                "ip",
+                "netns",
+                "exec",
+                hostname,
+                "pkill",
+                "-CONT",
+                "-f",
+                f"python.*{BASE_SERVER_PORT}",
+            ]
+
+            # Method 2: Fallback to SSH (for real network hosts)
+            cmd_ssh = [
+                "ssh",
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "ConnectTimeout=1",
+                f"root@{host_ip}",
+                f"pkill -CONT -f 'python.*{BASE_SERVER_PORT}' || pkill -CONT -f 'python3.*{BASE_SERVER_PORT}' || true",
+            ]
+
+            # Try Mininet namespace first
+            in_mininet_env = False
+            namespace_exists = False
+            try:
+                # Check if we're in a Mininet environment
+                check_ns = subprocess.run(
+                    ["ip", "netns", "list"],
+                    capture_output=True,
+                    timeout=0.5,
+                    text=True,
+                    check=False,
+                )
+                if check_ns.returncode == 0 and check_ns.stdout.strip():
+                    # We're in a namespace environment (likely Mininet)
+                    in_mininet_env = True
+                    namespaces = check_ns.stdout.strip().split("\n")
+                    namespace_exists = any(hostname in ns for ns in namespaces if ns)
+
+                    if namespace_exists:
+                        # Try to resume process in namespace
+                        result = subprocess.run(
+                            cmd_mininet,
+                            capture_output=True,
+                            timeout=1,
+                            text=True,
+                            check=False,
+                        )
+                        if result.returncode == 0:
+                            self.host_power_state[host_ip] = "ACTIVE"
+                            self.logger.info(
+                                f"[POWER] Host {host_ip} -> ACTIVE (server resumed via namespace)"
+                            )
+                            time.sleep(0.5)  # Small delay to ensure server is ready
+                            return
+                        else:
+                            self.logger.debug(
+                                f"[POWER] Namespace command returned {result.returncode} for {host_ip} (process may not exist)"
+                            )
+                    else:
+                        # Namespaces exist but this host's namespace not found
+                        self.logger.debug(
+                            f"[POWER] Namespace '{hostname}' not found in available namespaces"
+                        )
+                else:
+                    # No namespaces found - not in Mininet environment
+                    self.logger.debug(
+                        f"[POWER] No network namespaces found - not in Mininet environment"
+                    )
+            except Exception as e:
+                # Can't check namespaces - log but don't assume Mininet
+                self.logger.debug(f"[POWER] Cannot check namespaces for {host_ip}: {e}")
+
+            # CRITICAL: Only try SSH if we're NOT in a Mininet environment
+            # If in_mininet_env is True, NEVER try SSH (avoids timeouts)
+            # Also, if we're using Mininet IPs (10.0.0.x), assume Mininet and skip SSH
+            is_mininet_ip = host_ip.startswith("10.0.0.") and host_ip != VIRTUAL_IP
+
+            if not in_mininet_env and not is_mininet_ip:
+                # Only try SSH for non-Mininet IPs and when not in namespace environment
+                try:
+                    result = subprocess.run(
+                        cmd_ssh, capture_output=True, timeout=1, text=True, check=False
+                    )
+                    if result.returncode == 0:
+                        self.host_power_state[host_ip] = "ACTIVE"
+                        self.logger.info(
+                            f"[POWER] Host {host_ip} -> ACTIVE (server resumed via SSH)"
+                        )
+                        time.sleep(0.5)  # Small delay to ensure server is ready
+                        return
+                except Exception:
+                    # SSH not available - skip silently to avoid log spam
+                    pass
+            else:
+                # We're in Mininet - skip SSH to avoid timeouts
+                if in_mininet_env:
+                    self.logger.debug(
+                        f"[POWER] Skipping SSH for {host_ip} (Mininet namespace environment detected)"
+                    )
+                elif is_mininet_ip:
+                    self.logger.debug(
+                        f"[POWER] Skipping SSH for {host_ip} (Mininet IP range detected)"
+                    )
+
+            # If both methods failed, still update state for tracking
+            self.host_power_state[host_ip] = "ACTIVE"
+            self.logger.info(
+                f"[POWER] Host {host_ip} -> ACTIVE (state tracked - process control not available)"
+            )
+            time.sleep(0.5)  # Small delay to ensure server is ready
+
+        except Exception as e:
+            self.logger.warning(f"[POWER] Failed to wake {host_ip}: {e}")
+            # Still update state and continue
+            self.host_power_state[host_ip] = "ACTIVE"
 
     # --- Flow Installation ---
     def _install_client_to_server_flow(
@@ -544,39 +847,59 @@ class MTDMultiLayer(app_manager.RyuApp):
                 self.virtual_holder = "10.0.0.1"
             return
 
-        # Cycle through IPs
+        # Cycle through IPs - always hop to next IP to ensure rotation
+        old_holder = self.virtual_holder
         if self.virtual_holder not in ips:
             new = ips[0]
         else:
             idx = ips.index(self.virtual_holder)
             new = ips[(idx + 1) % len(ips)]
 
+        # Always update holder (ensures IP rotation even if called multiple times)
         if new != self.virtual_holder:
+            # Power management: Put old holder in low-power mode
+            if self.power_management_enabled and old_holder and old_holder != new:
+                self._put_host_in_low_power(old_holder)
+
             self.virtual_holder = new
             self.logger.info(
                 f"[L1 MTD] VIP {VIRTUAL_IP}:{self.current_vip_port} -> {self.virtual_holder} (IP Hop)"
             )
 
-            # Send GARP and install new forward flows
-            if self.virtual_holder in self.host_ip_map:
-                dpid, port, macaddr = self.host_ip_map[self.virtual_holder]
-                self._send_gratuitous_arp(
-                    self.dp_map.get(dpid), VIRTUAL_MAC, VIRTUAL_IP
+            # Power management: Wake up new holder
+            if self.power_management_enabled:
+                self._wake_host(self.virtual_holder)
+        else:
+            # This should only happen if there's only 1 IP in the list
+            # Still log and ensure flows are installed
+            if len(ips) == 1:
+                self.logger.debug(
+                    f"[L1 MTD] Only one host available ({self.virtual_holder}), cannot hop IP"
                 )
-                for dp2 in self.dp_map.values():
-                    try:
-                        # Install a catch-all flow for the current VIP port using the new RIP
-                        self._install_client_to_server_flow(
-                            dp2,
-                            self.virtual_holder,
-                            port,
-                            macaddr,
-                            self.current_vip_port,
-                        )
-                    except Exception:
-                        self.logger.exception(
-                            "install forward flow failed on dp %s during IP hop", dp2.id
-                        )
+            else:
+                # Should not happen - log warning
+                self.logger.warning(
+                    f"[L1 MTD] IP hop called but IP didn't change (current: {self.virtual_holder}, available: {ips})"
+                )
+
+        # Always send GARP and install flows (even if IP didn't change, port might have)
+        if self.virtual_holder in self.host_ip_map:
+            dpid, port, macaddr = self.host_ip_map[self.virtual_holder]
+            self._send_gratuitous_arp(self.dp_map.get(dpid), VIRTUAL_MAC, VIRTUAL_IP)
+            for dp2 in self.dp_map.values():
+                try:
+                    # Install a catch-all flow for the current VIP port using the new RIP
+                    self._install_client_to_server_flow(
+                        dp2,
+                        self.virtual_holder,
+                        port,
+                        macaddr,
+                        self.current_vip_port,
+                    )
+                except Exception:
+                    self.logger.exception(
+                        "install forward flow failed on dp %s during IP hop", dp2.id
+                    )
 
     def _hop_port(self):
         """Layer 2 MTD: Changes the Virtual Port (Medium Cost)."""
@@ -591,10 +914,15 @@ class MTDMultiLayer(app_manager.RyuApp):
             self.logger.info(f"[L2 MTD] VIP Port -> {self.current_vip_port} (Port Hop)")
 
             # L1 MTD is required to install the new flow for the new port
+            # This also ensures IP hopping happens with port hopping
             self._hop_ip()
 
             # CRITICAL FIX: PROACTIVE FLOW DELETION
             self._delete_old_flows(old_port)
+        else:
+            # Port wrapped around (shouldn't happen, but handle it)
+            # Still do IP hop to ensure rotation
+            self._hop_ip()
 
     def _decision_loop(self):
         """MTD Trade-off Engine: Decides which MTD layer to run based on policy."""
